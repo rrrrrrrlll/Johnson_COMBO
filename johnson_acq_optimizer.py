@@ -54,32 +54,72 @@ class JohnsonLSAcqOptimizer(AcqOptimizerBase):
         Optimizes the acquisition function using Hill Climbing with Swap mutations.
         Matches AcqOptimizerBase signature.
         """
-        assert n_suggestions == 1, "JohnsonAcqOptimizer currently only supports n_suggestions=1"
+
         if acq_evaluate_kwargs is None: acq_evaluate_kwargs = {}
         
-        if x.dim() == 1:
-            x = x.view(1, -1)
+        # Ensure input is 2D
+        if x.dim() == 1: x = x.view(1, -1)
+        N_dim = x.shape[1]
 
-        best_x = x[0:1].clone()
+        # 1. Initialize Multiple Starting Points (Walkers)
+        walkers = torch.zeros((n_suggestions, N_dim), dtype=x.dtype, device=x.device)
         
-        best_acq_val = acq_func(best_x, model=model, **acq_evaluate_kwargs)
+        # Walker 0: Starts at the provided best point (exploitation)
+        walkers[0] = x[0]
         
-        current_x = best_x
+        # Walkers 1..n: Start at random points from history (exploration)
+        if n_suggestions > 1:
+            if x_observed is not None and len(x_observed) > 0:
+                # Sample random indices from history
+                n_needed = n_suggestions - 1
+                indices = np.random.choice(len(x_observed), size=n_needed, replace=True)
+                history_samples = x_observed[indices].to(x.device)
+                walkers[1:] = history_samples
+            else:
+                # Fallback if no history: just clone the best point
+                # They will diverge later due to stochastic neighbors
+                walkers[1:] = x[0].clone()
 
-        # Hill Climbing Loop
-        for i in range(self.n_steps): 
-            candidates = self._get_swap_neighbors(current_x, n_neighbors=50)
+        # Track best point found by each walker
+        best_walkers = walkers.clone()
+        best_scores = acq_func(walkers, model=model, **acq_evaluate_kwargs).view(-1) # (n_suggestions,)
+        
+        # 2. Parallel Optimization Loop
+        for _ in range(self.n):
+            # Generate neighbors for EACH walker
+            # We create a large batch of candidates: (n_suggestions * 20, N)
+            candidate_batches = []
             
-            # FIX: Pass model explicitly
-            acq_vals = acq_func(candidates, model=model, **acq_evaluate_kwargs)
-            max_idx = torch.argmax(acq_vals)
+            for i in range(n_suggestions):
+                # Generate 20 neighbors for walker i
+                cands = self._get_swap_neighbors(walkers[i:i+1], n_neighbors=20)
+                candidate_batches.append(cands)
             
-            if acq_vals[max_idx] > best_acq_val.max():
-                best_acq_val = acq_vals[max_idx]
-                best_x = candidates[max_idx].unsqueeze(0)
-                current_x = best_x
+            # Combine into one tensor for efficient GP evaluation
+            all_candidates = torch.cat(candidate_batches, dim=0)
+            
+            # Evaluate all candidates at once
+            all_scores = acq_func(all_candidates, model=model, **acq_evaluate_kwargs).view(n_suggestions, 20)
+            
+            # 3. Update Step
+            # Find the best neighbor for each walker
+            max_scores, max_idxs = torch.max(all_scores, dim=1) # (n_suggestions,)
+            
+            # Check for improvement
+            improved = max_scores > best_scores
+            
+            # Update best scores where improved
+            best_scores = torch.where(improved, max_scores, best_scores)
+            
+            # Update walker positions where improved
+            for i in range(n_suggestions):
+                if improved[i]:
+                    new_pos = candidate_batches[i][max_idxs[i]]
+                    walkers[i] = new_pos
+                    best_walkers[i] = new_pos
                 
-        return best_x
+        return best_walkers
+
 
 
 # --- OPTION B: Simulated Annealing (SA) ---
